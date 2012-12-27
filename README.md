@@ -4,6 +4,7 @@ ruby_traceroute is a poor & naive traceroute just for my Net Dev homework.
 ---
 
 ###Usage:
+```
   ruby_traceroute [dest_addr|host] [options] <parameters>+
   sample: ruby_traceroute google.com
 where [options] are:
@@ -13,3 +14,4 @@ where [options] are:
        --port, -o <i>:   Protocol specific. For UDP and TCP, sets the base port number used in probes default:33434 (default: 33434)
         --version, -v:   Print version and exit
            --help, -h:   Show this message
+```
