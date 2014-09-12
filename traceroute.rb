@@ -1,84 +1,127 @@
-#!ruby -w
-# encoding:UTF-8
-#
+#!/usr/bin/env ruby
 
-require 'timeout'
-require 'socket'
-require './lib/lib_trollop.rb'
-include Socket::Constants
+msfbase='./metasploit-framework'
+$:.unshift(File.expand_path(File.join(File.expand_path(msfbase), 'lib')))
+$:.unshift(File.join(File.dirname(__FILE__), 'lib' ) )
 
-opts = Trollop::options do
-  version "ruby_tractroute 1.0.0 (c)"
-  banner <<-EOS
-ruby_traceroute is a poor & naive traceroute just for my Net Dev homework.
+require 'rex'
+require 'elasticsearch'
+require 'MsfRunMod'
+require 'Traceroute'
+require 'hashie'
+require 'Gengraph'
+require 'ipaddr'
+require 'pp'
+require 'oj'
+require 'tire'
+require 'yaml'
 
-Usage:
-  ruby_traceroute [dest_addr|host] [options] <parameters>+
-  sample: ruby_traceroute google.com
-where [options] are:
-  EOS
-  opt :max_ttl, "Set the max time-to-live (max number of hops) used in outgoing probe packets. default: 64", :default=>64
-  opt :first_ttl, "Set the initial time-to-live used in the first outgoing probe packet. default: 1", :default=>1
-  opt :pack_size, "Set the outgoing probe packet's size in byte. default: 0 byte, max: 512", :default=>0
-  opt :port, "Protocol specific. For UDP and TCP, sets the base port number used in probes default:33434", :default=>33434
+conf=File.join((File.expand_path File.dirname(__FILE__)), 'config.yml')
+raise "File not found! Create config.yml" unless File.exists?(conf)
+CONFIG = YAML.load_file(conf) unless defined? CONFIG
+
+index_name = 'netscan'
+Tire.index index_name do
+    #delete
+    create :mappings => {
+      :vmware => {
+        :properties      => {
+          :id            => { :type => 'string', :index => 'not_analyzed', :include_in_all => false },
+          :cluster       => { :type => 'multi_field' , :fields => {
+                             :cluster => {:type => 'string', :index => 'analyzed' },
+                             :raw => {:type => 'string', :index => 'not_analyzed' }}},
+          :host          => { :type => "nested", :properties => { 
+                             :name        => { :type => 'multi_field' , :fields => { 
+                                              :name => {:type => 'string', :index => 'analyzed' },
+                                              :raw => {:type => 'string', :index => 'not_analyzed' }}}},
+                             :gateway     => {:type => 'string' }},
+                             :portgroups  => { :type => "nested", :properties => { :name => { :type => 'string', :index => 'not_analyzed' }}},
+          :datastores    => { :type => 'string', :index => 'not_analyzed' },
+          :guestInet     => { :type => "nested", :properties => {
+                              :macAddress => { :type => 'string', :index => 'not_analyzed' },
+                              :IPs => { :type => "nested", :properties => {
+                                  :ipAddress => {:type => 'string' }}}}},
+          :guestHostname => { :type => 'multi_field' , :fields => { 
+                             :guestHostname => {:type => 'string', :index => 'analyzed' },
+                             :raw => {:type => 'string', :index => 'not_analyzed' }}},
+          #:time          => { :type => 'date', :format => "yyyy-MM-dd HH:mm:ss Z" }
+          :time     => { :type => 'date', :format => "dateOptionalTime" },
+       }},
+      :traceroute => {
+         :properties => {
+          :id       => { :type => 'string', :index => 'not_analyzed' },
+          :time     => { :type => 'date', :format => "dateOptionalTime" },
+          :path     => { :type => 'nested', :include_in_parent => true ,:properties => {
+                          :ttl => { :type => 'string', :index => 'not_analyzed'},
+                          :rtt => { :type => 'string' }
+                }
+             }
+         }
+      }   
+    }
+  end
+
+#args = { module_name: "auxiliary/scanner/portscan/tcp", params: [ "PORTS=443" , "RHOSTS=8.8.8.8"] }
+#msfmod = MsfRunMod.new(args)
+#msfmod.run!
+#puts msfmod.results
+
+ESHOST = 'localhost'
+ESPORT = '9200'
+es = Elasticsearch::Client.new hosts: [ESHOST+':'+ESPORT], reload_connections: true
+
+trace = Traceroute.new()
+hosts = Tire.search 'items',:type => 'host' do 
+          size 10000 
+          query {all}
+        end  
+
+hosts.results.each do |host|  
+  if host.type == 'vmware'
+    host.guestInet.each do |net|
+      net[:IPs].each do |ip|
+        ipaddr = IPAddr.new ip[:ipAddress]
+        if ipaddr.family == 2
+          trace.setaddr=ip[:ipAddress]
+          trace.run
+          trace.verbose=true
+          #trace.print('pretty')
+          trace.dnsname=host.guestHostname
+          trace.comments="EsxHost: " + host.host.name          
+          es.index index: 'netscan', type: 'traceroute', id: ip[:ipAddress], body: trace.getpath
+        end
+      end unless net[:IPs].nil?
+    end unless host.guestInet.nil?
+  end
+  if not host.scantype.traceroute.nil? and not host.privateIP.nil?
+    trace.setaddr=host.privateIP
+    trace.run
+    #trace.verbose=true
+    #trace.print('pretty')
+    pp "Traceroute for #{host.privateIP}"
+    es.index index: 'netscan', type: 'traceroute', id: trace.getfinaldest, body: trace.getpath
+  end
 end
 
-Trollop::die :pack_size, "should less than 512 bytes" if opts[:pack_size] >= 512
-
-port = opts[:port]
-max_hops = opts[:max_ttl]
-ttl = opts[:first_ttl]
-addr = Socket.getaddrinfo(ARGV[0], nil)[0][2]
-pack_size = opts[:pack_size]
-msg = Array.new(pack_size){'a'}.join()
-puts "traceroute to #{ARGV[0]} (#{addr}), #{max_hops} hops max, #{pack_size} byte packets"
-until ttl == max_hops
-  begin
-    recv_socket = Socket.open(AF_INET, SOCK_RAW, Socket::IPPROTO_ICMP)
-    send_socket = Socket.open(AF_INET, SOCK_DGRAM, Socket::IPPROTO_UDP)
-    send_socket.setsockopt(Socket::IPPROTO_IP, Socket::IP_TTL, ttl)
-  rescue Errno::EPERM
-    $stderr.puts "Must run #{$0} as root."
-    exit!
-  end
-
-  sockaddr = Socket.pack_sockaddr_in(port, '')
-  recv_socket.bind(sockaddr)
-  #send_socket.bind(sockaddr)
-  begin
-    send_socket.connect Socket.pack_sockaddr_in(port, ARGV[0])
-  rescue SocketError => err_msg
-    puts "Can't connect to remote host (#{err_msg})."
-    exit!
-  end
-
-  send_socket.send msg, 0
-
-  begin
-    send_time = Time.now
-    data, sender = recv_socket.recvfrom(1024)
-    recv_time = Time.now
-    time_cost = format("%0.3f", (recv_time - send_time) * 1000)
-    icmp_type = data.unpack('@20C')[0]
-    icmp_code = data.unpack('@21C')[0]
-    addr = Socket.unpack_sockaddr_in(sender)[1].to_s
-    host = Socket.getnameinfo(["AF_INET", 80, addr])[0]
-    puts "#{ttl}\t#{host} (#{addr})\t#{time_cost} ms"
-
-    if icmp_type == 3 && icmp_code == 13 then
-      puts "'Communication Administratively Prohibited' from this hop."
-      break
-    elsif icmp_type == 3 && icmp_code == 3 then
-      puts "Destination reached. Trace complete."
-      break
-    end
-  rescue SocketError => err_msg
-    puts err_msg
-    send_socket.close
-    recv_socket.close
-    exit!
-  end
-  ttl += 1
-end
-send_socket.close
-recv_socket.close
+hosts = Tire.search 'netscan',:type => 'traceroute' do 
+          size 10000 
+          query {all}
+        end           
+g = Gengraph.new("Network topology",'netscan_traceroute','twopi')
+hosts.results.each do |element|
+      ipmask = nil
+      host = Tire.search 'netscan' do query { string element.id } end
+      host.results.each do |h|
+        h.guestInet.each do |net|
+          net.IPs.each do |ip|
+            if ip.ipAddress == element.id 
+              ipmask = ip.prefixLength
+            end  
+          end
+        end
+      end
+      g.resetcounter
+      g.addpath(element.path,element.id,ipmask)      
+end  
+g.write(Regexp::escape(CONFIG['SVGPATH']+'netscan_traceroute.svg'))
+  
